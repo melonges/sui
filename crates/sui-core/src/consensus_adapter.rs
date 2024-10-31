@@ -41,7 +41,7 @@ use crate::consensus_handler::{classify, SequencedConsensusTransactionKey};
 use crate::consensus_throughput_calculator::{ConsensusThroughputProfiler, Level};
 use crate::epoch::reconfiguration::{ReconfigState, ReconfigurationInitiator};
 use crate::metrics::LatencyObserver;
-use consensus_core::ConnectionStatus;
+use consensus_core::{BlockStatus, ConnectionStatus};
 use mysten_metrics::{spawn_monitored_task, GaugeGuard, GaugeGuardFutureExt};
 use sui_protocol_config::ProtocolConfig;
 use sui_simulator::anemo::PeerId;
@@ -192,32 +192,7 @@ impl ConsensusAdapterMetrics {
     }
 }
 
-pub enum BlockStatus {
-    Sequenced,
-    GarbageCollected,
-}
-
-pub enum SubmitResponse {
-    NoStatusWaiter(BlockStatus),
-    WithStatusWaiter(oneshot::Receiver<consensus_core::BlockStatus>),
-}
-
-impl SubmitResponse {
-    pub async fn wait_for_status(self) -> SuiResult<BlockStatus> {
-        match self {
-            SubmitResponse::NoStatusWaiter(status) => Ok(status),
-            SubmitResponse::WithStatusWaiter(receiver) => match receiver.await {
-                Ok(status) => match status {
-                    consensus_core::BlockStatus::Sequenced(_) => Ok(BlockStatus::Sequenced),
-                    consensus_core::BlockStatus::GarbageCollected(_) => {
-                        Ok(BlockStatus::GarbageCollected)
-                    }
-                },
-                Err(e) => Err(SuiError::ConsensusConnectionBroken(format!("{:?}", e))),
-            },
-        }
-    }
-}
+pub type BlockStatusReceiver = oneshot::Receiver<BlockStatus>;
 
 #[mockall::automock]
 #[async_trait::async_trait]
@@ -236,7 +211,7 @@ pub trait ConsensusClient: Sync + Send + 'static {
         &self,
         transactions: &[ConsensusTransaction],
         epoch_store: &Arc<AuthorityPerEpochStore>,
-    ) -> SuiResult<SubmitResponse>;
+    ) -> SuiResult<BlockStatusReceiver>;
 }
 
 /// Submit Sui certificates to the consensus.
@@ -787,7 +762,7 @@ impl ConsensusAdapter {
 
                 loop {
                     // Submit the transaction to consensus and return the submit result with a status waiter
-                    let submit_result = self
+                    let status_waiter = self
                         .submit_inner(
                             &transactions,
                             epoch_store,
@@ -797,8 +772,8 @@ impl ConsensusAdapter {
                         )
                         .await;
 
-                    match submit_result.wait_for_status().await {
-                        Ok(BlockStatus::Sequenced) => {
+                    match status_waiter.await {
+                        Ok(BlockStatus::Sequenced(_)) => {
                             self.metrics
                                 .sequencing_certificate_status
                                 .with_label_values(&[tx_type, "sequenced"])
@@ -809,7 +784,7 @@ impl ConsensusAdapter {
                             );
                             break;
                         }
-                        Ok(BlockStatus::GarbageCollected) => {
+                        Ok(BlockStatus::GarbageCollected(_)) => {
                             self.metrics
                                 .sequencing_certificate_status
                                 .with_label_values(&[tx_type, "garbage_collected"])
@@ -823,9 +798,9 @@ impl ConsensusAdapter {
                             time::sleep(RETRY_DELAY_STEP).await;
                             continue;
                         }
-                        Err(_err) => {
+                        Err(err) => {
                             warn!(
-                                "Error while waiting for status from consensus for transactions {transaction_keys:?}. Will be retried."
+                                "Error while waiting for status from consensus for transactions {transaction_keys:?}, with error {:?}. Will be retried.", err
                             );
                             time::sleep(RETRY_DELAY_STEP).await;
                             continue;
@@ -899,11 +874,11 @@ impl ConsensusAdapter {
         transaction_keys: &[SequencedConsensusTransactionKey],
         tx_type: &str,
         is_soft_bundle: bool,
-    ) -> SubmitResponse {
+    ) -> BlockStatusReceiver {
         let ack_start = Instant::now();
         let mut retries: u32 = 0;
 
-        let submit_response = loop {
+        let status_waiter = loop {
             match self
                 .consensus_client
                 .submit(transactions, epoch_store)
@@ -955,7 +930,7 @@ impl ConsensusAdapter {
             .with_label_values(&[&bucket, tx_type])
             .observe(ack_start.elapsed().as_secs_f64());
 
-        submit_response
+        status_waiter
     }
 
     /// Waits for transactions to appear either to consensus output or been executed via a checkpoint (state sync).
