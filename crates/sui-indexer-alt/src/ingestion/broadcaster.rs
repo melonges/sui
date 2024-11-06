@@ -1,11 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-
 use backoff::backoff::Constant;
 use futures::{future::try_join_all, TryStreamExt};
 use mysten_metrics::spawn_monitored_task;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use sui_types::full_checkpoint_content::CheckpointData;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -32,13 +32,16 @@ pub(super) fn broadcaster(
 ) -> JoinHandle<()> {
     spawn_monitored_task!(async move {
         info!("Starting ingestion broadcaster");
+        let latest_ingested_checkpoint = Arc::new(AtomicU64::new(0));
 
         match ReceiverStream::new(checkpoint_rx)
             .map(Ok)
             .try_for_each_concurrent(/* limit */ config.ingest_concurrency, |cp| {
                 let client = client.clone();
                 let metrics = metrics.clone();
+                let metrics_clone = metrics.clone();
                 let subscribers = subscribers.clone();
+                let latest_ingested_checkpoint = latest_ingested_checkpoint.clone();
 
                 // One clone is for the supervisor to signal a cancel if it detects a
                 // subscriber that wants to wind down ingestion, and the other is to pass to
@@ -51,7 +54,7 @@ pub(super) fn broadcaster(
                 let backoff = Constant::new(config.retry_interval);
                 let fetch = move || {
                     let client = client.clone();
-                    let metrics = metrics.clone();
+                    let metrics = metrics_clone.clone();
                     let cancel = cancel.clone();
 
                     async move {
@@ -73,6 +76,11 @@ pub(super) fn broadcaster(
 
                 async move {
                     let checkpoint = backoff::future::retry(backoff, fetch).await?;
+                    let new_seq = checkpoint.checkpoint_summary.sequence_number;
+                    let old_seq = latest_ingested_checkpoint.fetch_max(new_seq, Ordering::Relaxed);
+                    if new_seq > old_seq {
+                        metrics.latest_ingested_checkpoint.set(new_seq as i64);
+                    }
                     let futures = subscribers.iter().map(|s| s.send(checkpoint.clone()));
 
                     if try_join_all(futures).await.is_err() {
