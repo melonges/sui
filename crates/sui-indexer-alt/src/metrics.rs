@@ -62,6 +62,7 @@ pub struct IndexerMetrics {
     pub total_ingested_not_found_retries: IntCounter,
 
     pub latest_ingested_checkpoint: IntGauge,
+    pub latest_ingested_checkpoint_timestamp_lag_ms: IntGauge,
 
     pub ingested_checkpoint_latency: Histogram,
 
@@ -205,6 +206,13 @@ impl IndexerMetrics {
             latest_ingested_checkpoint: register_int_gauge_with_registry!(
                 "indexer_latest_ingested_checkpoint",
                 "Latest checkpoint sequence number fetched from the remote store",
+                registry,
+            )
+            .unwrap(),
+            latest_ingested_checkpoint_timestamp_lag_ms: register_int_gauge_with_registry!(
+                "latest_ingested_checkpoint_timestamp_lag_ms",
+                "Difference between the system timestamp when the latest checkpoint was fetched and the \
+                 timestamp in the checkpoint, in milliseconds",
                 registry,
             )
             .unwrap(),

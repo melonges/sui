@@ -80,6 +80,10 @@ pub(super) fn broadcaster(
                     let old_seq = latest_ingested_checkpoint.fetch_max(new_seq, Ordering::Relaxed);
                     if new_seq > old_seq {
                         metrics.latest_ingested_checkpoint.set(new_seq as i64);
+                        metrics.latest_ingested_checkpoint_timestamp_lag_ms.set(
+                            chrono::Utc::now().timestamp_millis()
+                                - checkpoint.checkpoint_summary.timestamp_ms as i64,
+                        );
                     }
                     let futures = subscribers.iter().map(|s| s.send(checkpoint.clone()));
 
